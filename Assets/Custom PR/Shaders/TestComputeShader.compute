@@ -1,0 +1,133 @@
+#pragma kernel CSMain
+
+#include"LightInfo.hlsl"
+
+#define PER_TILE_LIGHT_COUNT 32
+#define MAX_LIGHT_COUNT 1024
+
+#define THREAD_NUM_X 16
+#define THREAD_NUM_Y 16
+#define THREAD_COUNT 256
+
+
+Texture2D _gdepth;
+//Create a RenderTexture with enableRandomWrite flag and set it
+//with cs.SetTexture
+//nz var
+//float4 _ScreenParams;
+//
+//RWTexture2D<float4> Result;
+//all lights buffer
+RWStructuredBuffer<uint> _RWTileLightsIndicesBuffer;
+RWStructuredBuffer<uint> _RWTileLightsArgsBuffer;
+//tile size and num
+float4 _DeferredTileParams;
+
+//mat
+float4x4 _vMatrix;
+
+//uniform float4 _ZBufferParams;
+//nearplane left bottompos
+uniform float3 _CameraNearPlaneLB;
+//nearplane x
+uniform float3 _CameraNearBasisH;
+//nearplane y
+uniform float3 _CameraNearBasisV;
+
+//lights' group
+groupshared uint tileVisibleLightIndices[MAX_LIGHT_COUNT];
+groupshared uint tileVisibleLightCount = 0;
+
+groupshared uint tileMinDepthInt = 0xFFFFFFFF;
+groupshared uint tileMaxDepthInt = 0;
+
+//inline float LinearEyeDepth(float z)
+//{
+//    return (1.0 / (_ZBufferParams.z * z + _ZBufferParams.w));
+//}
+
+
+bool IntersectAABB(float4 aabb, float4 lightSphere) {
+    float2 p = aabb.xy + aabb.zw * sign(lightSphere.xy - aabb.xy);
+    float2 d = p - lightSphere.xy;
+    return dot(d, d) < lightSphere.w * lightSphere.w;
+}
+
+bool Intersect(float3 tileFrustumCorners[4], float4 lightSphere) {
+    float tileDepthMin = asfloat(tileMinDepthInt);
+    float tileDepthMax = asfloat(tileMaxDepthInt);
+    float lightRadius = lightSphere.w;
+    float lightDepthMin = lightSphere.z - lightRadius;
+    float lightDepthMax = lightSphere.z + lightRadius;
+    if (lightDepthMin > tileDepthMax || lightDepthMax < tileDepthMin) {
+        return false;
+    }
+
+    float minZ = max(tileDepthMin, lightDepthMin);
+    float maxZ = min(tileDepthMax, lightDepthMax);
+    float farPlaneScale = maxZ / tileDepthMin;
+    float nearPlaneScale = minZ / tileDepthMin;
+    float2 minXY = tileFrustumCorners[0].xy;
+    float2 maxXY = tileFrustumCorners[2].xy;
+    minXY = min(minXY * nearPlaneScale, minXY * farPlaneScale);
+    maxXY = max(maxXY * nearPlaneScale, maxXY * farPlaneScale);
+    float4 aabb = float4((minXY + maxXY) * 0.5, (maxXY - minXY) * 0.5);
+    return IntersectAABB(aabb, lightSphere);
+}
+
+
+[numthreads(16, 16, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GROUPID, uint groupIndex : SV_GROUPINDEX)
+{
+    bool inScreen = (float)id.x < _ScreenParams.x && (float)id.y < _ScreenParams.y;
+    //stage
+    float depth = 0;
+    float linearDepth = 0;
+    if (inScreen) {
+        depth = _gdepth[id.xy].r;
+        linearDepth = LinearEyeDepth(depth);
+        InterlockedMin(tileMinDepthInt, asuint(linearDepth));
+        InterlockedMax(tileMaxDepthInt, asuint(linearDepth));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float tileDepthMin = asfloat(tileMinDepthInt);
+    float tileDepthMax = asfloat(tileMaxDepthInt);
+
+    //one pass 16x16=256
+    uint passCnt = ceil((float)PointLightCount / THREAD_COUNT);
+    uint2 tileId = groupId.xy;
+    float tileDepthMinScale = tileDepthMin / _ProjectionParams.y; //_ProjectionParams.y is nearPlaneZ
+    
+    float3 tileFrustumCorners[4];
+    tileFrustumCorners[0] = tileDepthMinScale * (_CameraNearPlaneLB + tileId.x * _CameraNearBasisH + tileId.y * _CameraNearBasisV);
+    tileFrustumCorners[1] = tileFrustumCorners[0] + _CameraNearBasisH * tileDepthMinScale;
+    tileFrustumCorners[2] = tileFrustumCorners[0] + (_CameraNearBasisH + _CameraNearBasisV) * tileDepthMinScale;
+    tileFrustumCorners[3] = tileFrustumCorners[0] + _CameraNearBasisV * tileDepthMinScale;
+
+    for (uint passIdx = 0; passIdx < passCnt; passIdx++) {
+        uint lightIndex = passIdx * THREAD_COUNT + groupIndex;
+        if (lightIndex < PointLightCount) {
+            float4 lightSphere = PointLightPositions[lightIndex];
+            lightSphere.xyz = mul(_vMatrix, float4(lightSphere.xyz, 1));//to CameraView
+            if (Intersect(tileFrustumCorners, lightSphere)) {
+                uint offset;
+                InterlockedAdd(tileVisibleLightCount, 1, offset);
+                tileVisibleLightIndices[offset] = lightIndex;
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    //switch to light
+    uint tileIndex = tileId.y * _DeferredTileParams.z + tileId.x;
+    //if tile first pixel
+    if (groupIndex == 0) {
+        _RWTileLightsArgsBuffer[tileIndex] = tileVisibleLightCount;
+    }
+    //max 32
+    if (groupIndex < tileVisibleLightCount && groupIndex < PER_TILE_LIGHT_COUNT) {
+        uint visibleLightIndex = tileVisibleLightIndices[groupIndex];
+        _RWTileLightsIndicesBuffer[tileIndex * PER_TILE_LIGHT_COUNT + groupIndex] = visibleLightIndex;
+    }
+}
